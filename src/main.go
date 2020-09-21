@@ -3,16 +3,13 @@ package main
 import (
 	"flag"
 
+	"github.com/abaskin/signald-rest-api/api"
+	_ "github.com/abaskin/signald-rest-api/docs"
 	"github.com/gin-gonic/gin"
 	log "github.com/sirupsen/logrus"
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
-	"github.com/bbernhard/signal-cli-rest-api/api"
-	_ "github.com/bbernhard/signal-cli-rest-api/docs"
-
 )
-
-
 
 // @title Signal Cli REST API
 // @version 1.0
@@ -33,14 +30,16 @@ import (
 // @host 127.0.0.1:8080
 // @BasePath /
 func main() {
-	signalCliConfig := flag.String("signal-cli-config", "/home/.local/share/signal-cli/", "Config directory where signal-cli config is stored")
+	signaldSocketPath := flag.String("signald-socket-path", "/var/run/signald/signald.sock", "signald socket path")
 	attachmentTmpDir := flag.String("attachment-tmp-dir", "/tmp/", "Attachment tmp directory")
 	flag.Parse()
 
 	router := gin.Default()
-	log.Info("Started Signal Messenger REST API")
+	// gin.SetMode(gin.ReleaseMode)
 
-	api := api.NewApi(*signalCliConfig, *attachmentTmpDir)	
+	log.Info("Started signald REST API")
+
+	api := api.NewApi(*signaldSocketPath, *attachmentTmpDir)
 	v1 := router.Group("/v1")
 	{
 		about := v1.Group("/about")
@@ -71,9 +70,9 @@ func main() {
 			groups.DELETE(":number/:groupid", api.DeleteGroup)
 		}
 
-		link := v1.Group("qrcodelink")
+		link := v1.Group("link")
 		{
-			link.GET("", api.GetQrCodeLink)
+			link.GET("", api.Link)
 		}
 	}
 

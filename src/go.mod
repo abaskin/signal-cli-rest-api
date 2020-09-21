@@ -1,8 +1,9 @@
-module github.com/bbernhard/signal-cli-rest-api
+module github.com/abaskin/signald-rest-api
 
 go 1.14
 
 require (
+	github.com/abaskin/signald-go v0.0.0-20200912033436-afb62757eb07
 	github.com/alecthomas/template v0.0.0-20190718012654-fb15b899a751
 	github.com/cpuguy83/go-md2man/v2 v2.0.0 // indirect
 	github.com/gin-gonic/gin v1.6.3

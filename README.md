@@ -1,11 +1,11 @@
 # Dockerized Signal Messenger REST API
 
-This project creates a small dockerized REST API around [signal-cli](https://github.com/AsamK/signal-cli).
+This project creates a small dockerized REST API around [signald](https://gitlab.com/thefinn93/signald).
 
 At the moment, the following functionality is exposed via REST:
 
 - Register a number
-- Verify the number using the code received via SMS
+- Verify the number using the code received via SMS with PIN support
 - Send message (+ attachments) to multiple recipients (or a group)
 - Receive messages
 - Link devices

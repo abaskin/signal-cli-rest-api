@@ -1,28 +1,26 @@
 package api
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
+	"io/ioutil"
+	"os"
+	"strings"
+
+	"github.com/abaskin/signald-go/signald"
 	"github.com/gin-gonic/gin"
-	uuid "github.com/gofrs/uuid"
 	"github.com/h2non/filetype"
 	log "github.com/sirupsen/logrus"
 	qrcode "github.com/skip2/go-qrcode"
-	"os"
-	"os/exec"
-	"strings"
-	"time"
 )
 
 const groupPrefix = "group."
 
 type GroupEntry struct {
 	Name       string   `json:"name"`
-	Id         string   `json:"id"`
-	InternalId string   `json:"internal_id"`
+	ID         string   `json:"id"`
+	InternalID string   `json:"internal_id"`
 	Members    []string `json:"members"`
 	Active     bool     `json:"active"`
 	Blocked    bool     `json:"blocked"`
@@ -56,71 +54,44 @@ type Error struct {
 }
 
 type About struct {
-	SupportedApiVersions []string `json:"versions"`
+	SupportedAPIVersions []string `json:"versions"`
 	BuildNr              int      `json:"build"`
 }
 
 type CreateGroup struct {
-	Id string `json:"id"`
+	ID string `json:"id"`
 }
 
-func convertInternalGroupIdToGroupId(internalId string) string {
-	return groupPrefix + base64.StdEncoding.EncodeToString([]byte(internalId))
+func convertInternalGroupIDToGroupID(internalID string) string {
+	return groupPrefix + base64.StdEncoding.EncodeToString([]byte(internalID))
 }
 
-func getStringInBetween(str string, start string, end string) (result string) {
-	i := strings.Index(str, start)
-	if i == -1 {
-		return
-	}
-	i += len(start)
-	j := strings.Index(str[i:], end)
-	if j == -1 {
-		return
-	}
-	return str[i : i+j]
-}
-
-func cleanupTmpFiles(paths []string) {
-	for _, path := range paths {
-		os.Remove(path)
-	}
-}
-
-func send(c *gin.Context, attachmentTmpDir string, signalCliConfig string, number string, message string,
-	recipients []string, base64Attachments []string, isGroup bool) {
-	cmd := []string{"--config", signalCliConfig, "-u", number, "send", "-m", message}
+func (a *Api) send(c *gin.Context, number string, message string, recipients []string,
+	base64Attachments []string, isGroup bool) {
 
 	if len(recipients) == 0 {
 		c.JSON(400, gin.H{"error": "Please specify at least one recipient"})
 		return
 	}
 
-	if !isGroup {
-		cmd = append(cmd, recipients...)
-	} else {
+	groupID := ""
+	if isGroup {
 		if len(recipients) > 1 {
-			c.JSON(400, gin.H{"error": "More than one recipient is currently not allowed"})
+			c.JSON(400, gin.H{"error": "More than one group is currently not allowed"})
 			return
 		}
 
-		groupId, err := base64.StdEncoding.DecodeString(recipients[0])
-		if err != nil {
+		if _, err := base64.StdEncoding.DecodeString(recipients[0]); err != nil {
 			c.JSON(400, gin.H{"error": "Invalid group id"})
 			return
 		}
 
-		cmd = append(cmd, []string{"-g", string(groupId)}...)
+		groupID = recipients[0]
+		recipients[0] = ""
 	}
 
-	attachmentTmpPaths := []string{}
+	attachments := []signald.RequestAttachment{}
 	for _, base64Attachment := range base64Attachments {
-		u, err := uuid.NewV4()
-		if err != nil {
-			c.JSON(400, gin.H{"error": err.Error()})
-			return
-		}
-
 		dec, err := base64.StdEncoding.DecodeString(base64Attachment)
 		if err != nil {
 			c.JSON(400, gin.H{"error": err.Error()})
@@ -133,23 +104,22 @@ func send(c *gin.Context, attachmentTmpDir string, signalCliConfig string, numbe
 			return
 		}
 
-		attachmentTmpPath := attachmentTmpDir + u.String() + "." + fType.Extension
-		attachmentTmpPaths = append(attachmentTmpPaths, attachmentTmpPath)
-
-		f, err := os.Create(attachmentTmpPath)
+		f, err := ioutil.TempFile(a.attachmentTmpDir, "signald-rest-api-*."+fType.Extension)
 		if err != nil {
 			c.JSON(400, gin.H{"error": err.Error()})
 			return
 		}
+		defer os.Remove(f.Name())
 		defer f.Close()
+		attachments = append(attachments, signald.RequestAttachment{
+			Filename: f.Name(),
+		})
 
 		if _, err := f.Write(dec); err != nil {
-			cleanupTmpFiles(attachmentTmpPaths)
 			c.JSON(400, gin.H{"error": err.Error()})
 			return
 		}
 		if err := f.Sync(); err != nil {
-			cleanupTmpFiles(attachmentTmpPaths)
 			c.JSON(400, gin.H{"error": err.Error()})
 			return
 		}
@@ -157,75 +127,43 @@ func send(c *gin.Context, attachmentTmpDir string, signalCliConfig string, numbe
 		f.Close()
 	}
 
-	if len(attachmentTmpPaths) > 0 {
-		cmd = append(cmd, "-a")
-		cmd = append(cmd, attachmentTmpPaths...)
+	for _, to := range recipients {
+		_, err := a.s.Send(number, signald.RequestAddress{Number: to},
+			groupID, message, attachments, signald.RequestQuote{})
+
+		if err != nil {
+			c.JSON(400, gin.H{"error": err.Error()})
+			return
+		}
 	}
 
-	_, err := runSignalCli(true, cmd)
-	if err != nil {
-		cleanupTmpFiles(attachmentTmpPaths)
-		c.JSON(400, gin.H{"error": err.Error()})
-		return
-	}
-
-	cleanupTmpFiles(attachmentTmpPaths)
 	c.JSON(201, nil)
 }
 
-func getGroups(number string, signalCliConfig string) ([]GroupEntry, error) {
+func (a *Api) getGroups(number string) ([]GroupEntry, error) {
 	groupEntries := []GroupEntry{}
 
-	out, err := runSignalCli(true, []string{"--config", signalCliConfig, "-u", number, "listGroups", "-d"})
+	message, err := a.s.ListGroups(number)
 	if err != nil {
 		return groupEntries, err
 	}
 
-	lines := strings.Split(out, "\n")
-	for _, line := range lines {
+	for _, group := range message.Data.Groups {
 		var groupEntry GroupEntry
-		if line == "" {
-			continue
+
+		groupEntry.InternalID = group.GroupID
+		groupEntry.ID = convertInternalGroupIDToGroupID(groupEntry.InternalID)
+		groupEntry.Name = group.Name
+
+		groupEntry.Active = false
+		for _, m := range group.Members {
+			groupEntry.Members = append(groupEntry.Members, m.Number)
+			if number == m.Number {
+				groupEntry.Active = true
+			}
 		}
 
-		idIdx := strings.Index(line, " Name: ")
-		idPair := line[:idIdx]
-		groupEntry.InternalId = strings.TrimPrefix(idPair, "Id: ")
-		groupEntry.Id = convertInternalGroupIdToGroupId(groupEntry.InternalId)
-		lineWithoutId := strings.TrimLeft(line[idIdx:], " ")
-
-		nameIdx := strings.Index(lineWithoutId, " Active: ")
-		namePair := lineWithoutId[:nameIdx]
-		groupEntry.Name = strings.TrimRight(strings.TrimPrefix(namePair, "Name: "), " ")
-		lineWithoutName := strings.TrimLeft(lineWithoutId[nameIdx:], " ")
-
-		activeIdx := strings.Index(lineWithoutName, " Blocked: ")
-		activePair := lineWithoutName[:activeIdx]
-		active := strings.TrimPrefix(activePair, "Active: ")
-		if active == "true" {
-			groupEntry.Active = true
-		} else {
-			groupEntry.Active = false
-		}
-		lineWithoutActive := strings.TrimLeft(lineWithoutName[activeIdx:], " ")
-
-		blockedIdx := strings.Index(lineWithoutActive, " Members: ")
-		blockedPair := lineWithoutActive[:blockedIdx]
-		blocked := strings.TrimPrefix(blockedPair, "Blocked: ")
-		if blocked == "true" {
-			groupEntry.Blocked = true
-		} else {
-			groupEntry.Blocked = false
-		}
-		lineWithoutBlocked := strings.TrimLeft(lineWithoutActive[blockedIdx:], " ")
-
-		membersPair := lineWithoutBlocked
-		members := strings.TrimPrefix(membersPair, "Members: ")
-		trimmedMembers := strings.TrimRight(strings.TrimLeft(members, "["), "]")
-		trimmedMembersList := strings.Split(trimmedMembers, ",")
-		for _, member := range trimmedMembersList {
-			groupEntry.Members = append(groupEntry.Members, strings.Trim(member, " "))
-		}
+		groupEntry.Blocked = false
 
 		groupEntries = append(groupEntries, groupEntry)
 	}
@@ -233,57 +171,19 @@ func getGroups(number string, signalCliConfig string) ([]GroupEntry, error) {
 	return groupEntries, nil
 }
 
-func runSignalCli(wait bool, args []string) (string, error) {
-	cmd := exec.Command("signal-cli", args...)
-	if wait {
-		var errBuffer bytes.Buffer
-		var outBuffer bytes.Buffer
-		cmd.Stderr = &errBuffer
-		cmd.Stdout = &outBuffer
-
-		err := cmd.Start()
-		if err != nil {
-			return "", err
-		}
-
-		done := make(chan error, 1)
-		go func() {
-			done <- cmd.Wait()
-		}()
-		select {
-		case <-time.After(60 * time.Second):
-			err := cmd.Process.Kill()
-			if err != nil {
-				return "", err
-			}
-			return "", errors.New("process killed as timeout reached")
-		case err := <-done:
-			if err != nil {
-				return "", errors.New(errBuffer.String())
-			}
-		}
-		return outBuffer.String(), nil
-	} else {
-		stdout, err := cmd.StdoutPipe()
-		if err != nil {
-			return "", err
-		}
-		cmd.Start()
-		buf := bufio.NewReader(stdout) // Notice that this is not in a loop
-		line, _, _ := buf.ReadLine()
-		return string(line), nil
-	}
-}
-
 type Api struct {
-	signalCliConfig  string
 	attachmentTmpDir string
+	s                *signald.Signald
 }
 
-func NewApi(signalCliConfig string, attachmentTmpDir string) *Api {
+func NewApi(signaldSocketPath string, attachmentTmpDir string) *Api {
 	return &Api{
-		signalCliConfig:  signalCliConfig,
 		attachmentTmpDir: attachmentTmpDir,
+		s: &signald.Signald{
+			SocketPath: signaldSocketPath,
+			Verbose:    false,
+			StatusJSON: true,
+		},
 	}
 }
 
@@ -295,7 +195,7 @@ func NewApi(signalCliConfig string, attachmentTmpDir string) *Api {
 // @Router /v1/about [get]
 func (a *Api) About(c *gin.Context) {
 
-	about := About{SupportedApiVersions: []string{"v1", "v2"}, BuildNr: 2}
+	about := About{SupportedAPIVersions: []string{"v1", "v2"}, BuildNr: 2}
 	c.JSON(200, about)
 }
 
@@ -331,14 +231,7 @@ func (a *Api) RegisterNumber(c *gin.Context) {
 		return
 	}
 
-	command := []string{"--config", a.signalCliConfig, "-u", number, "register"}
-
-	if req.UseVoice == true {
-		command = append(command, "--voice")
-	}
-
-	_, err := runSignalCli(true, command)
-	if err != nil {
+	if _, err := a.s.Register(number, "", req.UseVoice); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
@@ -384,14 +277,7 @@ func (a *Api) VerifyRegisteredNumber(c *gin.Context) {
 		return
 	}
 
-	cmd := []string{"--config", a.signalCliConfig, "-u", number, "verify", token}
-	if pin != "" {
-		cmd = append(cmd, "--pin")
-		cmd = append(cmd, pin)
-	}
-
-	_, err := runSignalCli(true, cmd)
-	if err != nil {
+	if _, err := a.s.Verify(number, token, pin); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
@@ -422,7 +308,7 @@ func (a *Api) Send(c *gin.Context) {
 		base64Attachments = append(base64Attachments, req.Base64Attachment)
 	}
 
-	send(c, a.signalCliConfig, a.signalCliConfig, req.Number, req.Message, req.Recipients, base64Attachments, req.IsGroup)
+	a.send(c, req.Number, req.Message, req.Recipients, base64Attachments, req.IsGroup)
 }
 
 // @Summary Send a signal message.
@@ -464,17 +350,17 @@ func (a *Api) SendV2(c *gin.Context) {
 		return
 	}
 
-	if len(groups) > 1 {
-		c.JSON(400, gin.H{"error": "A signal message cannot be sent to more than one group at once! Please use multiple REST API calls for that."})
-		return
-	}
+	// if len(groups) > 1 {
+	// 	c.JSON(400, gin.H{"error": "A signal message cannot be sent to more than one group at once! Please use multiple REST API calls for that."})
+	// 	return
+	// }
 
 	for _, group := range groups {
-		send(c, a.attachmentTmpDir, a.signalCliConfig, req.Number, req.Message, []string{group}, req.Base64Attachments, true)
+		a.send(c, req.Number, req.Message, []string{group}, req.Base64Attachments, true)
 	}
 
 	if len(recipients) > 0 {
-		send(c, a.attachmentTmpDir, a.signalCliConfig, req.Number, req.Message, recipients, req.Base64Attachments, false)
+		a.send(c, req.Number, req.Message, recipients, req.Base64Attachments, false)
 	}
 }
 
@@ -490,26 +376,20 @@ func (a *Api) SendV2(c *gin.Context) {
 func (a *Api) Receive(c *gin.Context) {
 	number := c.Param("number")
 
-	command := []string{"--config", a.signalCliConfig, "-u", number, "receive", "-t", "1", "--json"}
-	out, err := runSignalCli(true, command)
-	if err != nil {
-		c.JSON(400, gin.H{"error": err.Error()})
-		return
-	}
+	rc := make(chan signald.RawResponse)
+	sc := make(chan struct{})
+	a.s.Receive(rc, sc, number, 1, true)
 
-	out = strings.Trim(out, "\n")
-	lines := strings.Split(out, "\n")
+	message := signald.RawResponse{}
+	for {
+		message = <-rc
 
-	jsonStr := "["
-	for i, line := range lines {
-		jsonStr += line
-		if i != (len(lines) - 1) {
-			jsonStr += ","
+		if message.Done {
+			break
 		}
 	}
-	jsonStr += "]"
 
-	c.String(200, jsonStr)
+	c.JSON(200, message)
 }
 
 // @Summary Create a new Signal Group.
@@ -537,17 +417,26 @@ func (a *Api) CreateGroup(c *gin.Context) {
 		return
 	}
 
-	cmd := []string{"--config", a.signalCliConfig, "-u", number, "updateGroup", "-n", req.Name, "-m"}
-	cmd = append(cmd, req.Members...)
+	if _, err := a.s.CreateGroup(number, "", req.Name, req.Members, ""); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
 
-	out, err := runSignalCli(true, cmd)
+	message, err := a.s.ListGroups(number)
 	if err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
 
-	internalGroupId := getStringInBetween(out, `"`, `"`)
-	c.JSON(201, CreateGroup{Id: convertInternalGroupIdToGroupId(internalGroupId)})
+	internalGroupID := ""
+	for _, group := range message.Data.Groups {
+		if group.Name == req.Name {
+			internalGroupID = group.GroupID
+			break
+		}
+	}
+
+	c.JSON(201, CreateGroup{ID: convertInternalGroupIDToGroupID(internalGroupID)})
 }
 
 // @Summary List all Signal Groups.
@@ -562,7 +451,7 @@ func (a *Api) CreateGroup(c *gin.Context) {
 func (a *Api) GetGroups(c *gin.Context) {
 	number := c.Param("number")
 
-	groups, err := getGroups(number, a.signalCliConfig)
+	groups, err := a.getGroups(number)
 	if err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
@@ -582,25 +471,26 @@ func (a *Api) GetGroups(c *gin.Context) {
 // @Param groupid path string true "Group Id"
 // @Router /v1/groups/{number}/{groupid} [delete]
 func (a *Api) DeleteGroup(c *gin.Context) {
-	base64EncodedGroupId := c.Param("groupid")
+	base64EncodedGroupID := c.Param("groupid")
 	number := c.Param("number")
 
-	if base64EncodedGroupId == "" {
+	if base64EncodedGroupID == "" {
 		c.JSON(400, gin.H{"error": "Please specify a group id"})
 		return
 	}
 
-	groupId, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(base64EncodedGroupId, groupPrefix))
+	groupID, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(base64EncodedGroupID, groupPrefix))
 	if err != nil {
 		c.JSON(400, gin.H{"error": "Invalid group id"})
 		return
 	}
 
-	_, err = runSignalCli(true, []string{"--config", a.signalCliConfig, "-u", number, "quitGroup", "-g", string(groupId)})
-	if err != nil {
+	if _, err := a.s.LeaveGroup(number, base64.StdEncoding.EncodeToString(groupID)); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
+
+	c.JSON(200, nil)
 }
 
 // @Summary Link device and generate QR code.
@@ -608,8 +498,8 @@ func (a *Api) DeleteGroup(c *gin.Context) {
 // @Description test
 // @Produce  json
 // @Success 200 {string} string	"Image"
-// @Router /v1/qrcodelink [get]
-func (a *Api) GetQrCodeLink(c *gin.Context) {
+// @Router /v1/link [get]
+func (a *Api) Link(c *gin.Context) {
 	deviceName := c.Query("device_name")
 
 	if deviceName == "" {
@@ -617,17 +507,28 @@ func (a *Api) GetQrCodeLink(c *gin.Context) {
 		return
 	}
 
-	command := []string{"--config", a.signalCliConfig, "link", "-n", deviceName}
+	// We need to handle the socket connection so it stays up between function
+	// calls.
+	if !a.s.IsConnected() {
+		if err := a.s.Connect(); err != nil {
+			c.JSON(400, gin.H{"error": err.Error()})
+			return
+		}
+	}
 
-	tsdeviceLink, err := runSignalCli(false, command)
+	// First we call Link which returns the URI.
+	message, err := a.s.Link(deviceName, "")
 	if err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
+		a.s.Disconnect()
 		return
 	}
 
-	q, err := qrcode.New(string(tsdeviceLink), qrcode.Medium)
+	q, err := qrcode.New(message.Data.URI, qrcode.Medium)
 	if err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
+		a.s.Disconnect()
+		return
 	}
 
 	q.DisableBorder = true
@@ -635,7 +536,17 @@ func (a *Api) GetQrCodeLink(c *gin.Context) {
 	png, err = q.PNG(256)
 	if err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
+		a.s.Disconnect()
+		return
 	}
 
+	// display the QRcode
 	c.Data(200, "image/png", png)
+
+	// call Link a second time with the returned request ID to get the status
+	// of the link attempt.
+	go func() {
+		a.s.Link(deviceName, message.ID)
+		a.s.Disconnect()
+	}()
 }
