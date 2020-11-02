@@ -3,7 +3,6 @@ package api
 import (
 	"bytes"
 	"encoding/base64"
-	"encoding/json"
 	"io/ioutil"
 	"os"
 	"strings"
@@ -11,55 +10,45 @@ import (
 	"github.com/abaskin/signald-go/signald"
 	"github.com/gin-gonic/gin"
 	"github.com/h2non/filetype"
+	jsoniter "github.com/json-iterator/go"
 	log "github.com/sirupsen/logrus"
 	qrcode "github.com/skip2/go-qrcode"
 )
 
 const groupPrefix = "group."
 
-type GroupEntry struct {
-	Name       string   `json:"name"`
-	ID         string   `json:"id"`
-	InternalID string   `json:"internal_id"`
-	Members    []string `json:"members"`
-	Active     bool     `json:"active"`
-	Blocked    bool     `json:"blocked"`
+type groupEntry struct {
+	name       string   `json:"name"`
+	id         string   `json:"id"`
+	internalID string   `json:"internal_id"`
+	members    []string `json:"members"`
+	active     bool     `json:"active"`
+	blocked    bool     `json:"blocked"`
 }
 
-type RegisterNumberRequest struct {
-	UseVoice bool `json:"use_voice"`
+type request struct {
+	// Register Number
+	useVoice bool `json:"use_voice"`
+
+	// Verify Number
+	pin string `json:"pin"`
+
+	// Send Message
+	number            string   `json:"number"`
+	recipients        []string `json:"recipients"`
+	message           string   `json:"message"`
+	base64Attachment  string   `json:"base64_attachment"`
+	base64Attachments []string `json:"base64_attachments"` //V2
+	isGroup           bool     `json:"is_group"`
+
+	// Create Group
+	name    string   `json:"name"`
+	members []string `json:"members"`
 }
 
-type VerifyNumberSettings struct {
-	Pin string `json:"pin"`
-}
-
-type SendMessageV1 struct {
-	Number           string   `json:"number"`
-	Recipients       []string `json:"recipients"`
-	Message          string   `json:"message"`
-	Base64Attachment string   `json:"base64_attachment"`
-	IsGroup          bool     `json:"is_group"`
-}
-
-type SendMessageV2 struct {
-	Number            string   `json:"number"`
-	Recipients        []string `json:"recipients"`
-	Message           string   `json:"message"`
-	Base64Attachments []string `json:"base64_attachments"`
-}
-
-type Error struct {
-	Msg string `json:"error"`
-}
-
-type About struct {
-	SupportedAPIVersions []string `json:"versions"`
-	BuildNr              int      `json:"build"`
-}
-
-type CreateGroup struct {
-	ID string `json:"id"`
+type about struct {
+	supportedAPIVersions []string `json:"versions"`
+	buildNr              int      `json:"build"`
 }
 
 func convertInternalGroupIDToGroupID(internalID string) string {
@@ -140,8 +129,8 @@ func (a *Api) send(c *gin.Context, number string, message string, recipients []s
 	c.JSON(201, nil)
 }
 
-func (a *Api) getGroups(number string) ([]GroupEntry, error) {
-	groupEntries := []GroupEntry{}
+func (a *Api) getGroups(number string) ([]groupEntry, error) {
+	groupEntries := []groupEntry{}
 
 	message, err := a.s.ListGroups(number)
 	if err != nil {
@@ -149,23 +138,22 @@ func (a *Api) getGroups(number string) ([]GroupEntry, error) {
 	}
 
 	for _, group := range message.Data.Groups {
-		var groupEntry GroupEntry
+		g := groupEntry{
+			internalID: group.GroupID,
+			id:         convertInternalGroupIDToGroupID(group.GroupID),
+			name:       group.Name,
+			blocked:    false,
+			active:     false,
+		}
 
-		groupEntry.InternalID = group.GroupID
-		groupEntry.ID = convertInternalGroupIDToGroupID(groupEntry.InternalID)
-		groupEntry.Name = group.Name
-
-		groupEntry.Active = false
 		for _, m := range group.Members {
-			groupEntry.Members = append(groupEntry.Members, m.Number)
+			g.members = append(g.members, m.Number)
 			if number == m.Number {
-				groupEntry.Active = true
+				g.active = true
 			}
 		}
 
-		groupEntry.Blocked = false
-
-		groupEntries = append(groupEntries, groupEntry)
+		groupEntries = append(groupEntries, g)
 	}
 
 	return groupEntries, nil
@@ -194,9 +182,7 @@ func NewApi(signaldSocketPath string, attachmentTmpDir string) *Api {
 // @Success 200 {object} About
 // @Router /v1/about [get]
 func (a *Api) About(c *gin.Context) {
-
-	about := About{SupportedAPIVersions: []string{"v1", "v2"}, BuildNr: 2}
-	c.JSON(200, about)
+	c.JSON(200, about{supportedAPIVersions: []string{"v1", "v2"}, buildNr: 2})
 }
 
 // @Summary Register a phone number.
@@ -210,28 +196,24 @@ func (a *Api) About(c *gin.Context) {
 // @Router /v1/register/{number} [post]
 func (a *Api) RegisterNumber(c *gin.Context) {
 	number := c.Param("number")
-
-	var req RegisterNumberRequest
-
-	buf := new(bytes.Buffer)
-	buf.ReadFrom(c.Request.Body)
-	if buf.String() != "" {
-		err := json.Unmarshal(buf.Bytes(), &req)
-		if err != nil {
-			log.Error("Couldn't register number: ", err.Error())
-			c.JSON(400, Error{Msg: "Couldn't process request - invalid request."})
-			return
-		}
-	} else {
-		req.UseVoice = false
-	}
-
 	if number == "" {
 		c.JSON(400, gin.H{"error": "Please provide a number"})
 		return
 	}
 
-	if _, err := a.s.Register(number, "", req.UseVoice); err != nil {
+	req := request{}
+	buf := new(bytes.Buffer)
+	buf.ReadFrom(c.Request.Body)
+	if buf.String() != "" {
+		err := jsoniter.Unmarshal(buf.Bytes(), &req)
+		if err != nil {
+			log.Error("Couldn't register number: ", err.Error())
+			c.JSON(400, gin.H{"error": "Couldn't process request - invalid request."})
+			return
+		}
+	}
+
+	if _, err := a.s.Register(number, "", req.useVoice); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
@@ -251,33 +233,30 @@ func (a *Api) RegisterNumber(c *gin.Context) {
 // @Router /v1/register/{number}/verify/{token} [post]
 func (a *Api) VerifyRegisteredNumber(c *gin.Context) {
 	number := c.Param("number")
-	token := c.Param("token")
-
-	pin := ""
-	var req VerifyNumberSettings
-	buf := new(bytes.Buffer)
-	buf.ReadFrom(c.Request.Body)
-	if buf.String() != "" {
-		err := json.Unmarshal(buf.Bytes(), &req)
-		if err != nil {
-			log.Error("Couldn't verify number: ", err.Error())
-			c.JSON(400, Error{Msg: "Couldn't process request - invalid request."})
-			return
-		}
-		pin = req.Pin
-	}
-
 	if number == "" {
 		c.JSON(400, gin.H{"error": "Please provide a number"})
 		return
 	}
 
+	token := c.Param("token")
 	if token == "" {
 		c.JSON(400, gin.H{"error": "Please provide a verification code"})
 		return
 	}
 
-	if _, err := a.s.Verify(number, token, pin); err != nil {
+	req := request{}
+	buf := new(bytes.Buffer)
+	buf.ReadFrom(c.Request.Body)
+	if buf.String() != "" {
+		err := jsoniter.Unmarshal(buf.Bytes(), &req)
+		if err != nil {
+			log.Error("Couldn't verify number: ", err.Error())
+			c.JSON(400, gin.H{"error": "Couldn't process request - invalid request."})
+			return
+		}
+	}
+
+	if _, err := a.s.Verify(number, token, req.pin); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
@@ -295,20 +274,18 @@ func (a *Api) VerifyRegisteredNumber(c *gin.Context) {
 // @Router /v1/send [post]
 // @Deprecated
 func (a *Api) Send(c *gin.Context) {
-
-	var req SendMessageV1
-	err := c.BindJSON(&req)
-	if err != nil {
+	req := request{}
+	if err := c.BindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": "Couldn't process request - invalid request"})
 		return
 	}
 
 	base64Attachments := []string{}
-	if req.Base64Attachment != "" {
-		base64Attachments = append(base64Attachments, req.Base64Attachment)
+	if req.base64Attachment != "" {
+		base64Attachments = append(base64Attachments, req.base64Attachment)
 	}
 
-	a.send(c, req.Number, req.Message, req.Recipients, base64Attachments, req.IsGroup)
+	a.send(c, req.number, req.message, req.recipients, base64Attachments, req.isGroup)
 }
 
 // @Summary Send a signal message.
@@ -321,15 +298,14 @@ func (a *Api) Send(c *gin.Context) {
 // @Param data body SendMessageV2 true "Input Data"
 // @Router /v2/send [post]
 func (a *Api) SendV2(c *gin.Context) {
-	var req SendMessageV2
-	err := c.BindJSON(&req)
-	if err != nil {
+	req := request{}
+	if err := c.BindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": "Couldn't process request - invalid request"})
 		log.Error(err.Error())
 		return
 	}
 
-	if len(req.Recipients) == 0 {
+	if len(req.recipients) == 0 {
 		c.JSON(400, gin.H{"error": "Couldn't process request - please provide at least one recipient"})
 		return
 	}
@@ -337,7 +313,7 @@ func (a *Api) SendV2(c *gin.Context) {
 	groups := []string{}
 	recipients := []string{}
 
-	for _, recipient := range req.Recipients {
+	for _, recipient := range req.recipients {
 		if strings.HasPrefix(recipient, groupPrefix) {
 			groups = append(groups, strings.TrimPrefix(recipient, groupPrefix))
 		} else {
@@ -350,17 +326,18 @@ func (a *Api) SendV2(c *gin.Context) {
 		return
 	}
 
-	// if len(groups) > 1 {
-	// 	c.JSON(400, gin.H{"error": "A signal message cannot be sent to more than one group at once! Please use multiple REST API calls for that."})
-	// 	return
-	// }
-
-	for _, group := range groups {
-		a.send(c, req.Number, req.Message, []string{group}, req.Base64Attachments, true)
+	if len(groups) > 1 {
+		c.JSON(400, gin.H{"error": "A signal message cannot be sent to more than one group at once! Please use multiple REST API calls for that."})
+		return
 	}
 
 	if len(recipients) > 0 {
-		a.send(c, req.Number, req.Message, recipients, req.Base64Attachments, false)
+		a.send(c, req.number, req.message, recipients, req.base64Attachments, false)
+		return
+	}
+
+	for _, group := range groups {
+		a.send(c, req.number, req.message, []string{group}, req.base64Attachments, true)
 	}
 }
 
@@ -375,6 +352,10 @@ func (a *Api) SendV2(c *gin.Context) {
 // @Router /v1/receive/{number} [get]
 func (a *Api) Receive(c *gin.Context) {
 	number := c.Param("number")
+	if number == "" {
+		c.JSON(400, gin.H{"error": "Please provide a number"})
+		return
+	}
 
 	rc := make(chan signald.RawResponse)
 	sc := make(chan struct{})
@@ -403,21 +384,19 @@ func (a *Api) Receive(c *gin.Context) {
 // @Router /v1/groups/{number} [post]
 func (a *Api) CreateGroup(c *gin.Context) {
 	number := c.Param("number")
-
-	type Request struct {
-		Name    string   `json:"name"`
-		Members []string `json:"members"`
+	if number == "" {
+		c.JSON(400, gin.H{"error": "Please provide a number"})
+		return
 	}
 
-	var req Request
-	err := c.BindJSON(&req)
-	if err != nil {
+	req := request{}
+	if err := c.BindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": "Couldn't process request - invalid request"})
 		log.Error(err.Error())
 		return
 	}
 
-	if _, err := a.s.CreateGroup(number, "", req.Name, req.Members, ""); err != nil {
+	if _, err := a.s.CreateGroup(number, "", req.name, req.members, ""); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
@@ -430,13 +409,13 @@ func (a *Api) CreateGroup(c *gin.Context) {
 
 	internalGroupID := ""
 	for _, group := range message.Data.Groups {
-		if group.Name == req.Name {
+		if group.Name == req.name {
 			internalGroupID = group.GroupID
 			break
 		}
 	}
 
-	c.JSON(201, CreateGroup{ID: convertInternalGroupIDToGroupID(internalGroupID)})
+	c.JSON(201, gin.H{"id": convertInternalGroupIDToGroupID(internalGroupID)})
 }
 
 // @Summary List all Signal Groups.
@@ -450,6 +429,10 @@ func (a *Api) CreateGroup(c *gin.Context) {
 // @Router /v1/groups/{number} [get]
 func (a *Api) GetGroups(c *gin.Context) {
 	number := c.Param("number")
+	if number == "" {
+		c.JSON(400, gin.H{"error": "Please provide a number"})
+		return
+	}
 
 	groups, err := a.getGroups(number)
 	if err != nil {
@@ -471,9 +454,13 @@ func (a *Api) GetGroups(c *gin.Context) {
 // @Param groupid path string true "Group Id"
 // @Router /v1/groups/{number}/{groupid} [delete]
 func (a *Api) DeleteGroup(c *gin.Context) {
-	base64EncodedGroupID := c.Param("groupid")
 	number := c.Param("number")
+	if number == "" {
+		c.JSON(400, gin.H{"error": "Please provide a number"})
+		return
+	}
 
+	base64EncodedGroupID := c.Param("groupid")
 	if base64EncodedGroupID == "" {
 		c.JSON(400, gin.H{"error": "Please specify a group id"})
 		return
@@ -501,7 +488,6 @@ func (a *Api) DeleteGroup(c *gin.Context) {
 // @Router /v1/link [get]
 func (a *Api) Link(c *gin.Context) {
 	deviceName := c.Query("device_name")
-
 	if deviceName == "" {
 		c.JSON(400, gin.H{"error": "Please provide a name for the device"})
 		return
